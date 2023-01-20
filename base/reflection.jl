@@ -634,13 +634,14 @@ is reachable from this type (either in the type itself) or through any fields.
 Note that the type itself need not be immutable. For example, an empty mutable
 type is `ismutabletype`, but also `ismutationfree`.
 """
-function ismutationfree(@nospecialize(t::Type))
+function ismutationfree(@nospecialize(t))
     t = unwrap_unionall(t)
     if isa(t, DataType)
         return datatype_ismutationfree(t)
     elseif isa(t, Union)
         return ismutationfree(t.a) && ismutationfree(t.b)
     end
+    # TypeVar, etc.
     return false
 end
 
