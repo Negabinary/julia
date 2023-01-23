@@ -237,23 +237,84 @@ to interpolate code from the caller.
 
 Lowered form (IR) is more important to the compiler, since it is used for type inference,
 optimizations like inlining, and code generation. It is also less obvious to the human,
-since it results from a significant rearrangement of the input syntax.
+since it results from a significant rearrangement of the input syntax. 
+The lowered form of a function can be accessed using [`@code_lowered`](@ref) 
+and the type-inferred form using [`@code_typed`](@ref). 
+An overview of how these two forms are used in Julia execution can be found [here](@ref Julia-Execution).
 
-In addition to `Symbol`s and some number types, the following data
-types exist in lowered form:
+Both lowered forms come wrapped in [`CodeInfo`](@ref CodeInfo) containers. 
+The `code` field of these containers is an array of lines of intermediate code to execute. 
+In [`@code_lowered`](@ref) and [`@code_typed`](@ref), each line of intermediate code takes one of the following forms:
 
-  * `Expr`
+  * A value (@code_lowered and @code_typed) see details below.
 
-    Has a node type indicated by the `head` field, and an `args` field which is a `Vector{Any}` of
-    subexpressions.
-    While almost every part of a surface AST is represented by an `Expr`, the IR uses only a
-    limited number of `Expr`s, mostly for calls and some top-level-only forms.
+  * An expression (@code_lowered and @code_typed) see details below.
+
+  * `NewvarNode(slot::SlotNumber)` (@code_lowered)
+
+    Marks a point where a variable (slot) is created. This has the effect of resetting a variable to undefined.
+
+  * `GotoNode(label::Int)` (@code_lowered and @code_typed)
+
+    Unconditional branch. The `label` field is the branch target, represented as an index in
+    the code array to jump to.
+
+  * `GotoIfNot(cond::Any, dest::Int)` (@code_lowered and @code_typed)
+
+    Conditional branch. If the `cond` field evaluates to false, goes to the index identified
+    by the `dest` field.
+
+  * `ReturnNode(val::Any)` (@code_lowered and @code_typed)
+
+    Returns its argument (the `val` field) as the value of the enclosing function.
+    If the `val` field is undefined, then this represents an unreachable statement.
+
+  * `PhiNode(edges::Vector{Int32}, values::Vector{Any})` (@code_typed)
+
+    Used to choose different values based on previous branches. 
+    The `edges` field is a list of code indeces that could have come before this phi node, 
+    and the `values` field is a corresponding list of values for each incoming edge. 
+    For more information, see [here](#TODO).
+  
+  * `PiNode(val, typ)` (@code_typed)
+
+    Provides statically proven type information. 
+    Typically indicates that a branch was taken where in that branch we now know that `val` has type `typ`. 
+    For more information, see [here](#TODO).
+
+  * `UpsilonNode(val)` (@code_typed)
+
+    Indicates a value that a `PhiCNode` may read from.
+
+  * `PhiCNode(values::Vector{Any})` (@code_typed)
+
+    Used to determine the origin of a value after a try-catch block. 
+    The `values` field indicates all the `UpsilonNode` nodes that this node may take from.
+
+### Values
+
+  * `QuoteNode(value)`
+
+    Wraps an arbitrary value to reference as data. For example, the function `f() = :a` contains a
+    `QuoteNode` whose `value` field is the symbol `a`, in order to return the symbol itself instead
+    of evaluating it.
+  
+  * `SSAValue(id::Int)`
+
+    Refers to a consecutively-numbered (starting at 1) static single assignment (SSA) variable inserted
+    by the compiler. The number (`id`) of an `SSAValue` is the code array index of the expression whose
+    value it represents.
+
+  * `GlobalRef(mod::Module, name::Symbol)`
+
+    Refers to global variable `name` in module `mod`.
 
   * `Slot`
 
     Identifies arguments and local variables by consecutive numbering. `Slot` is an abstract type
-    with subtypes `SlotNumber` and `TypedSlot`. Both types have an integer-valued `id` field giving
-    the slot index. Most slots have the same type at all uses, and so are represented with `SlotNumber`.
+    with subtypes `SlotNumber(id::Int)` and `TypedSlot(id::Int)`. 
+    Both types have an integer-valued `id` field giving the slot index. 
+    Most slots have the same type at all uses, and so are represented with `SlotNumber`.
     The types of these slots are found in the `slottypes` field of their `CodeInfo` object.
     Slots that require per-use type annotations are represented with `TypedSlot`, which has a `typ`
     field.
@@ -261,293 +322,296 @@ types exist in lowered form:
   * `Argument`
 
     The same as `SlotNumber`, but appears only post-optimization. Indicates that the
-    referenced slot is an argument of the enclosing function.
+    referenced slot is an argument of the enclosing function.'
+  
+  * `NewSSAValue(id::Int)`
 
-  * `CodeInfo`
+    Used during `IncrementalCompact` optimisations. # TODO MORE!!!
 
-    Wraps the IR of a group of statements. Its `code` field is an array of expressions to execute.
+  * Any other type
 
-  * `GotoNode`
+    If a value has any other type, it does not need to be interpreted and will be used as-is.
+  
 
-    Unconditional branch. The argument is the branch target, represented as an index in
-    the code array to jump to.
+### Expressions
 
-  * `GotoIfNot`
+  * `Expr` (@code_typed)
 
-    Conditional branch. If the `cond` field evaluates to false, goes to the index identified
-    by the `dest` field.
+    Has a node type indicated by the `head` field, and an `args` field which is a `Vector{Any}` of
+    subexpressions.
+    While almost every part of a surface AST is represented by an `Expr`, the IR uses only a
+    limited number of `Expr`s, mostly for calls and some top-level-only forms.
 
-  * `ReturnNode`
+    These symbols appear in the `head` field of [`Expr`](@ref)s in lowered form.
 
-    Returns its argument (the `val` field) as the value of the enclosing function.
-    If the `val` field is undefined, then this represents an unreachable statement.
+      * `:call` (@code_lowered and @code_typed)
 
-  * `QuoteNode`
+        Function call (dynamic dispatch). `args[1]` is the function to call, `args[2:end]` are the arguments.
 
-    Wraps an arbitrary value to reference as data. For example, the function `f() = :a` contains a
-    `QuoteNode` whose `value` field is the symbol `a`, in order to return the symbol itself instead
-    of evaluating it.
+      * `:invoke` (@code_typed)
 
-  * `GlobalRef`
+        Function call (static dispatch). `args[1]` is the `MethodInstance` to call, `args[2:end]` are the
+        arguments (including the function that is being called, at `args[2]`).
 
-    Refers to global variable `name` in module `mod`.
+      * `:invoke_modify` (@code_typed) 
+      
+        Static dispatch for modifying a field of a specified object (e.g. in `structure.field = something`). `args[1]` is the `MethodInstance` to call, `args[2:end]` are the
+        arguments (including the function that is being called, at `args[2]`, and a representation of getfield at `args[3]`).
 
-  * `SSAValue`
+      * `:static_parameter` (@code_lowered)
 
-    Refers to a consecutively-numbered (starting at 1) static single assignment (SSA) variable inserted
-    by the compiler. The number (`id`) of an `SSAValue` is the code array index of the expression whose
-    value it represents.
+        Reference a static parameter by index.
 
-  * `NewvarNode`
+      * `:(=)` (@code_lowered and @code_typed)
 
-    Marks a point where a variable (slot) is created. This has the effect of resetting a variable to undefined.
+        Assignment. In the IR, the first argument is always a Slot or a GlobalRef.
+      
+      * `:(&)` (@code_lowered and @code_typed)
 
+        #TODO : Doesn't appear to be used in interpreter or compiler, only exists as a case in ssair/ir.jl?
 
-### `Expr` types
+      * `:method` (@code_lowered and @code_typed)
 
-These symbols appear in the `head` field of [`Expr`](@ref)s in lowered form.
+        Adds a method to a generic function and assigns the result if necessary.Has a 1-argument form and a 3-argument form. 
+        
+        The 1-argument form arises from the syntax `function foo end`.
+        In the 1-argument form, the argument is a symbol. If this symbol already names a function in the
+        current scope, nothing happens. If the symbol is undefined, a new function is created and assigned
+        to the identifier specified by the symbol. If the symbol is defined but names a non-function,
+        an error is raised. The definition of "names a function" is that the binding is constant, and
+        refers to an object of singleton type. The rationale for this is that an instance of a singleton
+        type uniquely identifies the type to add the method to. When the type has fields, it wouldn't
+        be clear whether the method was being added to the instance or its type.
 
-  * `call`
+        The 3-argument form has the following arguments:
 
-    Function call (dynamic dispatch). `args[1]` is the function to call, `args[2:end]` are the arguments.
+          * `args[1]`
 
-  * `invoke`
+            A function name, or `nothing` if unknown or unneeded. If a symbol, then the expression
+            first behaves like the 1-argument form above. This argument is ignored from then on.
+            It can be `nothing` when methods are added strictly by type, `(::T)(x) = x`,
+            or when a method is being added to an existing function, `MyModule.f(x) = x`.
 
-    Function call (static dispatch). `args[1]` is the MethodInstance to call, `args[2:end]` are the
-    arguments (including the function that is being called, at `args[2]`).
+          * `args[2]`
 
-  * `static_parameter`
+            A `SimpleVector` of argument type data. `args[2][1]` is a `SimpleVector` of the
+            argument types, and `args[2][2]` is a `SimpleVector` of type variables corresponding
+            to the method's static parameters.
 
-    Reference a static parameter by index.
+          * `args[3]`
 
-  * `=`
+            A `CodeInfo` of the method itself. For "out of scope" method definitions (adding a
+            method to a function that also has methods defined in different scopes) this is an
+            expression that evaluates to a `:lambda` expression.
 
-    Assignment. In the IR, the first argument is always a Slot or a GlobalRef.
+      * `:struct_type`
 
-  * `method`
+        A 7-argument expression that defines a new `struct`:
 
-    Adds a method to a generic function and assigns the result if necessary.
+          * `args[1]`
 
-    Has a 1-argument form and a 3-argument form. The 1-argument form arises from the syntax `function foo end`.
-    In the 1-argument form, the argument is a symbol. If this symbol already names a function in the
-    current scope, nothing happens. If the symbol is undefined, a new function is created and assigned
-    to the identifier specified by the symbol. If the symbol is defined but names a non-function,
-    an error is raised. The definition of "names a function" is that the binding is constant, and
-    refers to an object of singleton type. The rationale for this is that an instance of a singleton
-    type uniquely identifies the type to add the method to. When the type has fields, it wouldn't
-    be clear whether the method was being added to the instance or its type.
+            The name of the `struct`
 
-    The 3-argument form has the following arguments:
+          * `args[2]`
 
-      * `args[1]`
+            A `call` expression that creates a `SimpleVector` specifying its parameters
 
-        A function name, or `nothing` if unknown or unneeded. If a symbol, then the expression
-        first behaves like the 1-argument form above. This argument is ignored from then on.
-        It can be `nothing` when methods are added strictly by type, `(::T)(x) = x`,
-        or when a method is being added to an existing function, `MyModule.f(x) = x`.
+          * `args[3]`
 
-      * `args[2]`
+            A `call` expression that creates a `SimpleVector` specifying its fieldnames
 
-        A `SimpleVector` of argument type data. `args[2][1]` is a `SimpleVector` of the
-        argument types, and `args[2][2]` is a `SimpleVector` of type variables corresponding
-        to the method's static parameters.
+          * `args[4]`
 
-      * `args[3]`
+            A `Symbol`, `GlobalRef`, or `Expr` specifying the supertype (e.g., `:Integer`,
+            `GlobalRef(Core, :Any)`, or `:(Core.apply_type(AbstractArray, T, N))`)
 
-        A `CodeInfo` of the method itself. For "out of scope" method definitions (adding a
-        method to a function that also has methods defined in different scopes) this is an
-        expression that evaluates to a `:lambda` expression.
+          * `args[5]`
 
-  * `struct_type`
+            A `call` expression that creates a `SimpleVector` specifying its fieldtypes
 
-    A 7-argument expression that defines a new `struct`:
+          * `args[6]`
 
-      * `args[1]`
+            A Bool, true if `mutable`
 
-        The name of the `struct`
+          * `args[7]`
 
-      * `args[2]`
+            The number of arguments to initialize. This will be the number
+            of fields, or the minimum number of fields called by an inner
+            constructor's `new` statement.
 
-        A `call` expression that creates a `SimpleVector` specifying its parameters
+      * `:abstract_type`
 
-      * `args[3]`
+        A 3-argument expression that defines a new abstract type. The
+        arguments are the same as arguments 1, 2, and 4 of
+        `struct_type` expressions.
 
-        A `call` expression that creates a `SimpleVector` specifying its fieldnames
+      * `:primitive_type`
 
-      * `args[4]`
+        A 4-argument expression that defines a new primitive type. Arguments 1, 2, and 4
+        are the same as `struct_type`. Argument 3 is the number of bits.
 
-        A `Symbol`, `GlobalRef`, or `Expr` specifying the supertype (e.g., `:Integer`,
-        `GlobalRef(Core, :Any)`, or `:(Core.apply_type(AbstractArray, T, N))`)
+        !!! compat "Julia 1.5"
+            `struct_type`, `abstract_type`, and `primitive_type` were removed in Julia 1.5
+            and replaced by calls to new builtins.
 
-      * `args[5]`
+      * `:global`
 
-        A `call` expression that creates a `SimpleVector` specifying its fieldtypes
+        Declares a global binding.
 
-      * `args[6]`
+      * `:const`
 
-        A Bool, true if `mutable`
+        Declares a (global) variable as constant.
 
-      * `args[7]`
+      * `:new` (@code_lowered and @code_typed)
 
-        The number of arguments to initialize. This will be the number
-        of fields, or the minimum number of fields called by an inner
-        constructor's `new` statement.
+        Allocates a new struct-like object. First argument is the type. The [`new`](@ref) pseudo-function is lowered
+        to this, and the type is always inserted by the compiler.  This is very much an internal-only
+        feature, and does no checking. Evaluating arbitrary `new` expressions can easily segfault.
 
-  * `abstract_type`
+      * `:splatnew` (@code_lowered and @code_typed)
 
-    A 3-argument expression that defines a new abstract type. The
-    arguments are the same as arguments 1, 2, and 4 of
-    `struct_type` expressions.
+        Similar to `new`, except field values are passed as a single tuple. Works similarly to
+        `Base.Splat(new)` if `new` were a first-class function, hence the name.
 
-  * `primitive_type`
+      * `:isdefined` (@code_lowered and @code_typed)
 
-    A 4-argument expression that defines a new primitive type. Arguments 1, 2, and 4
-    are the same as `struct_type`. Argument 3 is the number of bits.
+        `Expr(:isdefined, :x)` returns a Bool indicating whether `x` has
+        already been defined in the current scope.
 
-    !!! compat "Julia 1.5"
-        `struct_type`, `abstract_type`, and `primitive_type` were removed in Julia 1.5
-        and replaced by calls to new builtins.
+      * `:the_exception`(@code_lowered)
 
-  * `global`
+        Yields the caught exception inside a `catch` block, as returned by `jl_current_exception()`.
 
-    Declares a global binding.
+      * `:undefcheck` (@code_lowered and @code_typed)
 
-  * `const`
+        Temporary node inserted by the compiler and will be processed in `type_lift_pass!`.
 
-    Declares a (global) variable as constant.
+      * `:throw_undef_if_not` (@code_lowered and @code_typed)
 
-  * `new`
+        Throw an undefined exception if `args[2]` evaluates to false.
 
-    Allocates a new struct-like object. First argument is the type. The [`new`](@ref) pseudo-function is lowered
-    to this, and the type is always inserted by the compiler.  This is very much an internal-only
-    feature, and does no checking. Evaluating arbitrary `new` expressions can easily segfault.
+      * `:enter` (@code_lowered and @code_typed)
 
-  * `splatnew`
+        Enters an exception handler (`setjmp`). `args[1]` is the label of the catch block to jump to on
+        error.  Yields a token which is consumed by `pop_exception`.
 
-    Similar to `new`, except field values are passed as a single tuple. Works similarly to
-    `splat(new)` if `new` were a first-class function, hence the name.
+      * `:leave` (@code_lowered and @code_typed)
 
-  * `isdefined`
+        Pop exception handlers. `args[1]` is the number of handlers to pop.
 
-    `Expr(:isdefined, :x)` returns a Bool indicating whether `x` has
-    already been defined in the current scope.
+      * `:pop_exception`(@code_typed)
 
-  * `the_exception`
+        Pop the stack of current exceptions back to the state at the associated `enter` when leaving a
+        catch block. `args[1]` contains the token from the associated `enter`.
 
-    Yields the caught exception inside a `catch` block, as returned by `jl_current_exception()`.
+        !!! compat "Julia 1.1"
+            `pop_exception` is new in Julia 1.1.
 
-  * `undefcheck`
+      * `:inbounds` (@code_lowered)
 
-    Temporary node inserted by the compiler and will be processed in `type_lift_pass!`.
+        Controls turning bounds checks on or off. A stack is maintained; if the first argument of this
+        expression is true or false (`true` means bounds checks are disabled), it is pushed onto the stack.
+        If the first argument is `:pop`, the stack is popped.
 
-  * `enter`
+      * `:boundscheck` (@code_lowered)
 
-    Enters an exception handler (`setjmp`). `args[1]` is the label of the catch block to jump to on
-    error.  Yields a token which is consumed by `pop_exception`.
+        Has the value `false` if inlined into a section of code marked with `@inbounds`,
+        otherwise has the value `true`.
 
-  * `leave`
+      * `:loopinfo` (@code_lowered)
 
-    Pop exception handlers. `args[1]` is the number of handlers to pop.
+        Marks the end of the a loop. Contains metadata that is passed to `LowerSimdLoop` to either mark
+        the inner loop of `@simd` expression, or to propagate information to LLVM loop passes.
 
-  * `pop_exception`
+      * `:copyast` (@code_lowered and @code_typed)
 
-    Pop the stack of current exceptions back to the state at the associated `enter` when leaving a
-    catch block. `args[1]` contains the token from the associated `enter`.
+        Part of the implementation of quasi-quote. The argument is a surface syntax AST that is simply
+        copied recursively and returned at run time.
 
-    !!! compat "Julia 1.1"
-        `pop_exception` is new in Julia 1.1.
+      * `:meta` 
 
-  * `inbounds`
+        Metadata. `args[1]` is typically a symbol specifying the kind of metadata, and the rest of the
+        arguments are free-form. The following kinds of metadata are commonly used:
 
-    Controls turning bounds checks on or off. A stack is maintained; if the first argument of this
-    expression is true or false (`true` means bounds checks are disabled), it is pushed onto the stack.
-    If the first argument is `:pop`, the stack is popped.
+          * `:inline` and `:noinline`: Inlining hints.
 
-  * `boundscheck`
+      * `:foreigncall` (@code_typed)
 
-    Has the value `false` if inlined into a section of code marked with `@inbounds`,
-    otherwise has the value `true`.
+        Statically-computed container for `ccall` information. The fields are:
 
-  * `loopinfo`
+          * `args[1]` : name
 
-    Marks the end of the a loop. Contains metadata that is passed to `LowerSimdLoop` to either mark
-    the inner loop of `@simd` expression, or to propagate information to LLVM loop passes.
+            The expression that'll be parsed for the foreign function.
 
-  * `copyast`
+          * `args[2]::Type` : RT
 
-    Part of the implementation of quasi-quote. The argument is a surface syntax AST that is simply
-    copied recursively and returned at run time.
+            The (literal) return type, computed statically when the containing method was defined.
 
-  * `meta`
+          * `args[3]::SimpleVector` (of Types) : AT
 
-    Metadata. `args[1]` is typically a symbol specifying the kind of metadata, and the rest of the
-    arguments are free-form. The following kinds of metadata are commonly used:
+            The (literal) vector of argument types, computed statically when the containing method was defined.
 
-      * `:inline` and `:noinline`: Inlining hints.
+          * `args[4]::Int` : nreq
 
-  * `foreigncall`
+            The number of required arguments for a varargs function definition.
 
-    Statically-computed container for `ccall` information. The fields are:
+          * `args[5]::QuoteNode{Symbol}` : calling convention
 
-      * `args[1]` : name
+            The calling convention for the call.
 
-        The expression that'll be parsed for the foreign function.
+          * `args[6:5+length(args[3])]` : arguments
 
-      * `args[2]::Type` : RT
+            The values for all the arguments (with types of each given in args[3]).
 
-        The (literal) return type, computed statically when the containing method was defined.
+          * `args[6+length(args[3])+1:end]` : gc-roots
 
-      * `args[3]::SimpleVector` (of Types) : AT
+            The additional objects that may need to be gc-rooted for the duration of the call.
+            See [Working with LLVM](@ref Working-with-LLVM) for where these are derived from and how they get handled.
 
-        The (literal) vector of argument types, computed statically when the containing method was defined.
+      * `:cfunction` (@code_typed)
 
-      * `args[4]::Int` : nreq
+        #TODO
 
-        The number of required arguments for a varargs function definition.
+      * `:new_opaque_closure` (@code_typed)
 
-      * `args[5]::QuoteNode{Symbol}` : calling convention
+        Constructs a new opaque closure. The fields are:
 
-        The calling convention for the call.
+          * `args[1]` : signature
 
-      * `args[6:5+length(args[3])]` : arguments
+            The function signature of the opaque closure. Opaque closures don't participate in dispatch, but the input types can be restricted.
 
-        The values for all the arguments (with types of each given in args[3]).
+          * `args[2]` : isva
 
-      * `args[6+length(args[3])+1:end]` : gc-roots
+            Indicates whether the closure accepts varargs.
 
-        The additional objects that may need to be gc-rooted for the duration of the call.
-        See [Working with LLVM](@ref Working-with-LLVM) for where these are derived from and how they get handled.
+          * `args[3]` : lb
 
-  * `new_opaque_closure`
+            Lower bound on the output type. (Defaults to `Union{}`)
 
-    Constructs a new opaque closure. The fields are:
+          * `args[4]` : ub
 
-      * `args[1]` : signature
+            Upper bound on the output type. (Defaults to `Any`)
 
-        The function signature of the opaque closure. Opaque closures don't participate in dispatch, but the input types can be restricted.
+          * `args[5]` : method
 
-      * `args[2]` : isva
+            The actual method as an `opaque_closure_method` expression.
 
-        Indicates whether the closure accepts varargs.
+          * `args[6:end]` : captures
 
-      * `args[3]` : lb
+            The values captured by the opaque closure.
 
-        Lower bound on the output type. (Defaults to `Union{}`)
+        !!! compat "Julia 1.7"
+            Opaque closures were added in Julia 1.7
+      
+      * `:gc_preserve_begin` (@code_typed)
 
-      * `args[4]` : ub
+        #TODO
 
-        Upper bound on the output type. (Defaults to `Any`)
+      * `:gc_preserve_end` (@code_typed)
 
-      * `args[5]` : method
+        #TODO
 
-        The actual method as an `opaque_closure_method` expression.
-
-      * `args[6:end]` : captures
-
-        The values captured by the opaque closure.
-
-    !!! compat "Julia 1.7"
-        Opaque closures were added in Julia 1.7
+#TODO !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
 ### [Method](@id ast-lowered-method)
